@@ -1,0 +1,385 @@
+"""
+STEP 2 — Baseline Inference: VLM (4-bit) + SigLIP RAG
+======================================================
+Input:  facebook-data/dev.jsonl
+        facebook-data/img/
+        pipeline/rag_store/embeddings.npy
+        pipeline/rag_store/metadata.pkl
+
+Output: output/preds_<model_slug>_4bit_siglip_rag.jsonl
+          one JSON object per line: {"id": …, "label": 0|1, "raw_output": "…"}
+
+Usage:
+  python pipeline/run_baseline.py                         # default: Qwen3-VL-8B-Instruct
+  python pipeline/run_baseline.py --model qwen3vl
+  python pipeline/run_baseline.py --model qwen3vl-thinking
+  python pipeline/run_baseline.py --model llama4-scout
+  python pipeline/run_baseline.py --model llava
+
+Supported --model keys  (see MODEL_REGISTRY below):
+  qwen3vl           Qwen/Qwen3-VL-8B-Instruct
+  qwen3vl-thinking  Qwen/Qwen3-VL-8B-Thinking
+  llama4-scout      meta-llama/Llama-4-Scout-17B-16E-Instruct
+  llava             llava-hf/llava-v1.6-mistral-7b-hf
+"""
+
+import argparse
+import json
+import pickle
+import re
+import sys
+import numpy as np
+import torch
+from pathlib import Path
+from PIL import Image
+from tqdm import tqdm
+from transformers import (
+    AutoModelForImageTextToText,
+    AutoProcessor,
+    BitsAndBytesConfig,
+    LlavaNextForConditionalGeneration,
+    LlavaNextProcessor,
+    SiglipModel,
+    SiglipProcessor,
+)
+
+# ── Paths ─────────────────────────────────────────────────────────────────────
+BASE        = Path(__file__).resolve().parents[1]
+TEST_JSONL  = BASE / "facebook-data" / "dev.jsonl"
+FB_IMG_DIR  = BASE / "facebook-data" / "img"
+RAG_STORE   = BASE / "pipeline" / "rag_store"
+EMBED_PATH  = RAG_STORE / "embeddings.npy"
+META_PATH   = RAG_STORE / "metadata.pkl"
+OUTPUT_DIR  = BASE / "output"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SIGLIP_MODEL = "google/siglip-base-patch16-224"
+RAG_K        = 3
+
+
+# ── Model registry ────────────────────────────────────────────────────────────
+# Each entry defines how to load and run a specific model.
+#
+#   hf_id       : HuggingFace model ID
+#   slug        : short name used in the output filename
+#   loader      : "auto"   → AutoModelForImageTextToText + AutoProcessor
+#                 "llava"  → LlavaNextForConditionalGeneration + LlavaNextProcessor
+#   thinking    : True if the model emits <think>…</think> before its answer
+#                 (Qwen3-VL-Thinking) — parse_label strips that block first
+#   max_new_tokens : generation budget (thinking models need more)
+
+MODEL_REGISTRY = {
+    "qwen3vl": {
+        "hf_id":          "Qwen/Qwen3-VL-8B-Instruct",
+        "slug":           "qwen3vl_8b",
+        "loader":         "auto",
+        "max_new_tokens": 64,
+    },
+    "qwen3vl-thinking": {
+        "hf_id":          "Qwen/Qwen3-VL-8B-Thinking",
+        "slug":           "qwen3vl_8b_thinking",
+        "loader":         "auto",
+        "max_new_tokens": 512,   # needs room for the <think> block
+    },
+    "llava": {
+        "hf_id":          "llava-hf/llava-v1.6-mistral-7b-hf",
+        "slug":           "llava_v16_mistral_7b",
+        "loader":         "llava",
+        "max_new_tokens": 64,
+    },
+}
+
+DEFAULT_MODEL = "qwen3vl"
+
+
+# ── SigLIP retriever ──────────────────────────────────────────────────────────
+
+class SigLIPRetriever:
+    def __init__(self, embed_path: Path, meta_path: Path, device: str):
+        self.device = device
+
+        self.embeddings = np.load(embed_path).astype("float32")
+        with open(meta_path, "rb") as f:
+            self.metadata = pickle.load(f)
+
+        norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+        self.embeddings = self.embeddings / np.where(norms == 0, 1, norms)
+
+        print(f"Loaded {len(self.embeddings)} RAG embeddings  (dim={self.embeddings.shape[1]})")
+        print(f"Loading SigLIP ({SIGLIP_MODEL}) for query encoding…")
+        self.model     = SiglipModel.from_pretrained(SIGLIP_MODEL).to(device).eval()
+        self.processor = SiglipProcessor.from_pretrained(SIGLIP_MODEL)
+
+    def retrieve(self, image: Image.Image, text: str, k: int = RAG_K) -> list[str]:
+        inputs = self.processor(
+            text=[text or " "],
+            images=[image],
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+        ).to(self.device)
+
+        with torch.no_grad():
+            out        = self.model(**inputs)
+            img_embed  = out.image_embeds[0].cpu().float().numpy()
+            text_embed = out.text_embeds[0].cpu().float().numpy()
+
+        img_embed  /= np.linalg.norm(img_embed)  + 1e-8
+        text_embed /= np.linalg.norm(text_embed) + 1e-8
+        query = np.concatenate([img_embed, text_embed])
+        query /= np.linalg.norm(query) + 1e-8
+
+        scores = self.embeddings @ query
+        top_k  = np.argsort(scores)[-k:][::-1]
+
+        contexts = []
+        for idx in top_k:
+            m = self.metadata[idx]
+            lines = []
+            if m.get("title"):
+                lines.append(f"Title: {m['title']}")
+            if m.get("meme_captions"):
+                lines.append(f"Meaning: {m['meme_captions'][0]}")
+            if m.get("img_captions"):
+                lines.append(f"Visual: {m['img_captions'][0]}")
+            contexts.append("\n".join(lines))
+
+        return contexts
+
+
+# ── Prompt & output parsing ───────────────────────────────────────────────────
+
+def build_prompt(meme_text: str, rag_contexts: list[str]) -> str:
+    context_block = "\n\n".join(
+        f"[Example {i+1}]\n{ctx}" for i, ctx in enumerate(rag_contexts)
+    )
+    return (
+        "You are an objective content moderator.\n\n"
+        "Below are similar meme examples retrieved for context:\n"
+        f"{context_block}\n\n"
+        "Now classify the meme shown in the image.\n"
+        f"Meme text: \"{meme_text}\"\n\n"
+        "Respond with ONLY valid JSON — no explanation, no markdown fences.\n"
+        '{"label": 0}  →  not hateful\n'
+        '{"label": 1}  →  hateful'
+    )
+
+
+def extract_thinking(raw: str) -> tuple[str, str]:
+    """
+    Split raw output into (thinking_text, answer_text).
+    For non-thinking models, thinking_text is always "".
+    """
+    match = re.search(r'<think>(.*?)</think>(.*)', raw, flags=re.DOTALL)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return "", raw.strip()
+
+
+def parse_label(answer: str) -> int:
+    match = re.search(r'"label"\s*:\s*([01])', answer)
+    if match:
+        return int(match.group(1))
+    match = re.search(r'\b([01])\b', answer)
+    return int(match.group(1)) if match else 0
+
+
+# ── Model loaders ─────────────────────────────────────────────────────────────
+
+def load_model(cfg: dict):
+    """Load model + processor according to the registry entry."""
+    bnb_cfg = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    if cfg["loader"] == "llava":
+        model = LlavaNextForConditionalGeneration.from_pretrained(
+            cfg["hf_id"],
+            quantization_config=bnb_cfg,
+            device_map="auto",
+        )
+        processor = LlavaNextProcessor.from_pretrained(cfg["hf_id"])
+    else:
+        model = AutoModelForImageTextToText.from_pretrained(
+            cfg["hf_id"],
+            quantization_config=bnb_cfg,
+            device_map="auto",
+        )
+        processor = AutoProcessor.from_pretrained(cfg["hf_id"])
+
+    return model, processor
+
+
+# ── Per-model inference call ──────────────────────────────────────────────────
+
+def run_inference(model, processor, image: Image.Image, prompt_text: str, cfg: dict) -> str:
+    """Run one forward pass and return raw decoded output."""
+
+    if cfg["loader"] == "llava":
+        # LLaVA uses a different prompt format: <image> token in text
+        prompt = f"[INST] <image>\n{prompt_text} [/INST]"
+        inputs = processor(
+            text=prompt,
+            images=image,
+            return_tensors="pt",
+        ).to(model.device)
+    else:
+        # Qwen-VL, Llama 4, and other chat models use apply_chat_template
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text",  "text":  prompt_text},
+            ],
+        }]
+        text_input = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = processor(
+            text=[text_input],
+            images=[image],
+            return_tensors="pt",
+        ).to(model.device)
+
+    with torch.no_grad():
+        gen_ids = model.generate(
+            **inputs,
+            max_new_tokens=cfg["max_new_tokens"],
+            do_sample=False,
+        )
+
+    input_len = inputs.input_ids.shape[1]
+    return processor.decode(gen_ids[0][input_len:], skip_special_tokens=True)
+
+
+# ── Per-model inference loop ──────────────────────────────────────────────────
+
+def run_model(cfg: dict, samples: list, retriever: SigLIPRetriever) -> Path:
+    """
+    Run inference for a single model over all samples.
+    Skips already-processed IDs (resume support).
+    Returns the path to the output file.
+    """
+    output_file = OUTPUT_DIR / f"preds_{cfg['slug']}_4bit_siglip_rag.jsonl"
+
+    print(f"\nLoading {cfg['hf_id']} with 4-bit quantization…")
+    model, processor = load_model(cfg)
+    print("Model loaded.")
+
+    already_done = set()
+    if output_file.exists():
+        with open(output_file) as f:
+            for line in f:
+                try:
+                    already_done.add(json.loads(line)["id"])
+                except Exception:
+                    pass
+        print(f"Resuming — {len(already_done)} samples already processed.")
+
+    with open(output_file, "a") as out_f:
+        for sample in tqdm(samples, desc=cfg["slug"], file=sys.stdout):
+            sample_id = sample["id"]
+            if sample_id in already_done:
+                continue
+
+            img_name  = Path(sample.get("img", "")).name
+            img_path  = FB_IMG_DIR / img_name
+            meme_text = sample.get("text", "")
+
+            try:
+                image = Image.open(img_path).convert("RGB")
+                image.thumbnail((512, 512))
+            except Exception as e:
+                out_f.write(json.dumps({"id": sample_id, "label": 0, "raw_output": "", "error": str(e)}) + "\n")
+                out_f.flush()
+                continue
+
+            try:
+                contexts = retriever.retrieve(image, meme_text, k=RAG_K)
+            except Exception:
+                contexts = []
+
+            prompt_text = build_prompt(meme_text, contexts)
+
+            try:
+                raw_output = run_inference(model, processor, image, prompt_text, cfg)
+            except Exception as e:
+                out_f.write(json.dumps({"id": sample_id, "label": 0, "raw_output": "", "error": str(e)}) + "\n")
+                out_f.flush()
+                continue
+
+            thinking_text, answer_text = extract_thinking(raw_output)
+            label = parse_label(answer_text)
+            out_f.write(json.dumps({
+                "id":         sample_id,
+                "label":      label,
+                "thinking":   thinking_text,   # "" for non-thinking models
+                "answer":     answer_text,
+                "raw_output": raw_output,
+            }) + "\n")
+            out_f.flush()
+            sys.stdout.flush()
+
+    print(f"Predictions saved → {output_file}")
+
+    # Free GPU memory before loading the next model
+    del model
+    torch.cuda.empty_cache()
+
+    return output_file
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Baseline VLM inference with SigLIP RAG")
+    parser.add_argument(
+        "--model",
+        default=None,
+        choices=list(MODEL_REGISTRY.keys()),
+        help=(
+            f"Single model to run. If omitted, all models in MODEL_REGISTRY are run. "
+            f"Choices: {', '.join(MODEL_REGISTRY.keys())}"
+        ),
+    )
+    args = parser.parse_args()
+
+    models_to_run = [args.model] if args.model else list(MODEL_REGISTRY.keys())
+
+    print("=" * 60)
+    print("Step 2 — Baseline Inference (all models)")
+    print(f"Models   : {', '.join(models_to_run)}")
+    print("=" * 60)
+
+    with open(TEST_JSONL) as f:
+        samples = [json.loads(l) for l in f if l.strip()]
+    print(f"Loaded {len(samples)} samples from {TEST_JSONL.name}")
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    retriever = SigLIPRetriever(EMBED_PATH, META_PATH, device)
+
+    failed = []
+    for key in models_to_run:
+        cfg = MODEL_REGISTRY[key]
+        print(f"\n{'=' * 60}")
+        print(f"Model {models_to_run.index(key) + 1}/{len(models_to_run)}: {cfg['hf_id']}")
+        print(f"{'=' * 60}")
+        try:
+            run_model(cfg, samples, retriever)
+        except Exception as e:
+            print(f"ERROR running {key}: {e}")
+            failed.append(key)
+
+    print(f"\n{'=' * 60}")
+    print("All models complete.")
+    if failed:
+        print(f"Failed: {', '.join(failed)}")
+    print("Run pipeline/evaluate.py to compute metrics.")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()

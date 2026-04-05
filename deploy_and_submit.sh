@@ -21,6 +21,8 @@ rsync -azP \
   --exclude '.pip-tmp' \
   --exclude '.env_gcc' \
   --exclude 'pipeline/rag_store' \
+  --exclude 'pipeline/rag_store_memecap' \
+  --exclude 'pipeline/rag_store_full' \
   --exclude 'output' \
   . "${REMOTE_USER}@${REMOTE_HOST}:~/${REMOTE_TARGET}"
 

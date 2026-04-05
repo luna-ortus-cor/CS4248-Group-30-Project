@@ -37,21 +37,25 @@ else
 fi
 
 # ── Step 1: Build SigLIP RAG (skip if already built) ─────────────────────────
-RAG_EMBEDDINGS="pipeline/rag_store/embeddings.npy"
-RAG_METADATA="pipeline/rag_store/metadata.pkl"
+# Default store is "full" (MemeCap + captioned HMD data).
+# Override: RAG_STORE=memecap ./remote_run.sh
+RAG_STORE_ARG="${RAG_STORE:-full}"
+RAG_EMBEDDINGS="pipeline/rag_store_${RAG_STORE_ARG}/embeddings.npy"
+RAG_METADATA="pipeline/rag_store_${RAG_STORE_ARG}/metadata.pkl"
 
 if [ -f "$RAG_EMBEDDINGS" ] && [ -f "$RAG_METADATA" ]; then
-  echo "RAG store already exists, skipping step 1."
+  echo "RAG store '${RAG_STORE_ARG}' already exists — skipping build."
 else
-  echo "Building SigLIP RAG knowledge base..."
-  "$PYBIN" -u pipeline/build_siglip_rag.py 2>&1 | tee "$LOG_DIR/step1_build_rag.log"
+  echo "Building SigLIP RAG knowledge base (--store ${RAG_STORE_ARG})..."
+  "$PYBIN" -u pipeline/build_siglip_rag.py --store "${RAG_STORE_ARG}" 2>&1 | tee "$LOG_DIR/step1_build_rag.log"
 fi
 
 # ── Step 2: Run all models ────────────────────────────────────────────────────
 # run_baseline.py loops over MODEL_REGISTRY automatically when no --model is given.
 # Pass --model <key> here to run a single model instead.
+# --rag-store is forwarded automatically from RAG_STORE_ARG.
 echo "Running all models..."
-"$PYBIN" -u pipeline/run_baseline.py "$@" 2>&1 | tee "$LOG_DIR/step2_inference.log"
+"$PYBIN" -u pipeline/run_baseline.py --rag-store "${RAG_STORE_ARG}" "$@" 2>&1 | tee "$LOG_DIR/step2_inference.log"
 
 # ── Step 3: Evaluate all predictions ─────────────────────────────────────────
 echo ""
