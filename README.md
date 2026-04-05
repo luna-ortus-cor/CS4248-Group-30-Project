@@ -69,8 +69,7 @@ This syncs code to `~/CS4248/<project-folder>` on the remote and excludes `.venv
 ```bash
 ssh <name>@xlogin.comp.nus.edu.sg
 cd ~/CS4248/<project-folder>
-chmod +x remote_setup.sh remote_run.sh
-./remote_setup.sh
+srun --gres=gpu:a100-80:1 --mem=32G --time=01:00:00 bash remote_setup.sh
 ```
 
 ### 4) Run inference on GPU
