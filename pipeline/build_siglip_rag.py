@@ -42,11 +42,9 @@ BASE             = Path(__file__).resolve().parents[1]
 MEMECAP_TRAINVAL = BASE / "memecap-data" / "memes-trainval.json"
 MEMECAP_TEST     = BASE / "memecap-data" / "memes-test.json"
 MEMECAP_IMG_DIR  = BASE / "memecap-data" / "memes"
-HMD_JSONL_FILES  = [
-    BASE / "captioned-hmd-data" / "captions_output1.jsonl",
-    BASE / "captioned-hmd-data" / "captions_output2.jsonl",
-    BASE / "captioned-hmd-data" / "captions_output3.jsonl",
-]
+HMD_JSONL_FILES  = sorted(
+    (BASE / "hateful-captioning" / "train").glob("captions_train_chunk*.jsonl")
+)
 HMD_IMG_DIR      = BASE / "facebook-data"   # img_fname is e.g. "img/42953.png"
 
 STORE_DIRS = {
